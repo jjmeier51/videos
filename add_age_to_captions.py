@@ -8,8 +8,8 @@ year-named subdirectories), read each file's capture date from its
 embedded metadata, compute your age on that date, prepend the age to the
 file's caption, and rename the file so the age is part of the filename:
 
-    Me/2024/IMG_1234.jpg  ->  Me/2024/IMG_1234_(1y3m).jpg
-    (and its caption becomes:  "Age 1y3m — <original caption>")
+    Me/2024/IMG_1234.jpg  ->  Me/2024/IMG_1234_(1).jpg
+    (and its caption becomes:  "Age 1 — <original caption>")
 
 Both images and videos are supported.
 
@@ -83,34 +83,26 @@ CAPTION_READ_TAGS = [
     "Title",
 ]
 
-# Matches a filename stem that already ends in an age suffix like "_(1y3m)",
-# "_(2y)" or "_(7m)" so we don't process a file twice.
-AGE_SUFFIX_RE = re.compile(r"_\(\d+y(?:\d+m)?\)$|_\(\d+m\)$")
+# Matches a filename stem that already ends in an age suffix like "_(2)"
+# so we don't process a file twice.
+AGE_SUFFIX_RE = re.compile(r"_\(\d+\)$")
 
 
 # --------------------------------------------------------------------------
 # Age helpers
 # --------------------------------------------------------------------------
 
-def age_on(dob: date, on: date) -> tuple[int, int]:
-    """Return (years, months) of age on a given date."""
+def age_on(dob: date, on: date) -> int:
+    """Return age in whole completed years on a given date."""
     years = on.year - dob.year
-    months = on.month - dob.month
-    if on.day < dob.day:
-        months -= 1
-    if months < 0:
+    if (on.month, on.day) < (dob.month, dob.day):
         years -= 1
-        months += 12
-    return years, months
+    return years
 
 
-def age_token(years: int, months: int) -> str:
-    """Compact, filesystem-safe age string, e.g. '1y3m', '2y', '7m'."""
-    if years and months:
-        return f"{years}y{months}m"
-    if years:
-        return f"{years}y"
-    return f"{months}m"
+def age_token(years: int) -> str:
+    """Filesystem-safe age string, e.g. '0', '1', '2'."""
+    return str(years)
 
 
 # --------------------------------------------------------------------------
@@ -212,10 +204,10 @@ def process_file(path: Path, dob: date, dry_run: bool) -> str:
     if capture_date is None:
         return f"SKIP  (no capture date found): {path.name}"
 
-    years, months = age_on(dob, capture_date)
+    years = age_on(dob, capture_date)
     if years < 0:
         return f"SKIP  (dated before DOB: {capture_date}): {path.name}"
-    token = age_token(years, months)
+    token = age_token(years)
 
     # Build the new caption: age prepended to whatever was there before.
     existing = pick_existing_caption(meta)
