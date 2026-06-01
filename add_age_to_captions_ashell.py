@@ -5,23 +5,31 @@ add_age_to_captions_ashell.py
 
 Pure-Python version for iOS a-Shell (no ExifTool / Perl needed).
 
-Walk a directory tree of personal photos (organized into year-named
-subdirectories), read each JPEG's capture date from its EXIF data,
-compute your age on that date, prepend the age to the photo's caption
-(EXIF ImageDescription), and rename the file so the age is in the name:
+Your media lives in `Me/<year>/...` (year-named subdirectories). This
+script reads those year subdirectories first, and for each photo/video it
+uses the YEAR of its folder to compute your age:
 
-    Me/2024/IMG_1234.jpg  ->  Me/2024/IMG_1234_(1).jpg
-    (and its caption becomes:  "Age 1 - <original caption>")
+        age = <year folder>  -  <birth year>
+
+That age is prepended to the caption (for JPEGs) and appended to the
+filename for every photo and video:
+
+    Me/2026/IMG_1234.jpg  ->  Me/2026/IMG_1234_(24).jpg
+    (and its caption becomes:  "Age 24 - <original caption>")
+
+Driving the age from the YEAR FOLDER (instead of each file's EXIF date)
+is deliberate: many files have no reliable embedded date, and after
+copying to iOS their file timestamps all look like "today", which is what
+produced the wrong ages before.
 
 ------------------------------------------------------------------------
-IMPORTANT LIMITATIONS (because this avoids ExifTool)
+What gets changed
 ------------------------------------------------------------------------
-This uses the pure-Python `piexif` library, which only supports JPEG and
-TIFF. The following are SKIPPED (you'll see a SKIP line for each):
-    * HEIC / HEIF  (the default iPhone photo format!)
-    * PNG
-    * All videos (.mp4, .mov, ...)
-If you need those too, run the ExifTool version under the iSH app instead.
+* Every photo AND video is RENAMED to include the age:  name_(age).ext
+* The caption is EMBEDDED only for JPEG (.jpg/.jpeg), because the pure-
+  Python `piexif` library can only write those. HEIC / PNG / videos are
+  still renamed, but their caption can't be embedded on iOS without
+  ExifTool (use the iSH app for that). Each such file prints a note.
 
 ------------------------------------------------------------------------
 Setup in a-Shell
@@ -31,17 +39,19 @@ Setup in a-Shell
 ------------------------------------------------------------------------
 Usage
 ------------------------------------------------------------------------
-    # Preview only, change nothing (recommended first run):
-    python add_age_to_captions_ashell.py Me --dry-run
+    # 1) Reverse the previous (incorrect) run -- preview then apply:
+    python add_age_to_captions_ashell.py Me --undo --dry-run
+    python add_age_to_captions_ashell.py Me --undo
 
-    # Apply for real:
+    # 2) Run correctly -- preview then apply:
+    python add_age_to_captions_ashell.py Me --dry-run
     python add_age_to_captions_ashell.py Me
 
-    # Override date of birth if needed:
-    python add_age_to_captions_ashell.py Me --dob 2023-09-01
+    # Override birth date if ever needed:
+    python add_age_to_captions_ashell.py Me --dob 2002-09-01
 
-The script is idempotent: files already ending in "_(age)" are skipped,
-so it's safe to re-run.
+Idempotent & reversible: re-running skips files already tagged, and
+--undo restores original names/captions.
 """
 
 from __future__ import annotations
@@ -63,127 +73,172 @@ except ImportError:
 # Configuration
 # --------------------------------------------------------------------------
 
-DEFAULT_DOB = date(2023, 9, 1)
+DEFAULT_DOB = date(2002, 9, 1)
 
-# Formats piexif can actually read/write.
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".tif", ".tiff"}
+# Photos + videos we will rename.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".3gp"}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
-# Formats we explicitly recognize as media but cannot handle here.
-UNSUPPORTED_MEDIA_EXTS = {
-    ".heic", ".heif", ".png", ".webp",
-    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".3gp",
-}
+# Only these can have a caption embedded by piexif.
+CAPTION_EXTS = {".jpg", ".jpeg"}
 
-# Filename stems already ending in an age suffix like "_(2)".
+# A 4-digit year, used both to recognize year folders and the age suffix.
+YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+# Filename stems already ending in an age suffix like "_(24)".
 AGE_SUFFIX_RE = re.compile(r"_\(\d+\)$")
 
-
-# --------------------------------------------------------------------------
-# Age helpers
-# --------------------------------------------------------------------------
-
-def age_on(dob: date, on: date) -> int:
-    """Age in whole completed years on a given date."""
-    years = on.year - dob.year
-    if (on.month, on.day) < (dob.month, dob.day):
-        years -= 1
-    return years
+# Matches a caption this script previously wrote, so --undo can restore the
+# original text:  "Age 24"  or  "Age 24 - some original caption"
+ADDED_CAPTION_RE = re.compile(r"^Age \d+(?: - (?P<orig>.*))?$", re.DOTALL)
 
 
 # --------------------------------------------------------------------------
-# EXIF helpers (piexif)
+# Year / age helpers
 # --------------------------------------------------------------------------
 
-def _to_text(value) -> str:
-    """EXIF string values come back as bytes; decode them leniently."""
-    if isinstance(value, bytes):
-        return value.split(b"\x00")[0].decode("utf-8", "replace").strip()
-    return str(value).strip()
+def folder_year(path: Path, root: Path) -> int | None:
+    """Walk up from the file to `root`, returning the first year-named folder."""
+    for parent in path.parents:
+        if YEAR_RE.match(parent.name):
+            return int(parent.name)
+        if parent == root:
+            break
+    return None
 
 
-def get_capture_date(exif: dict, path: Path) -> tuple[date | None, str]:
-    """First usable capture date from EXIF, falling back to file mtime."""
-    candidates = [
-        ("Exif", piexif.ExifIFD.DateTimeOriginal, "DateTimeOriginal"),
-        ("Exif", piexif.ExifIFD.DateTimeDigitized, "DateTimeDigitized"),
-        ("0th", piexif.ImageIFD.DateTime, "DateTime"),
-    ]
-    for ifd, tag, name in candidates:
+def exif_year(path: Path) -> int | None:
+    """Best-effort capture year from JPEG EXIF (fallback only)."""
+    try:
+        exif = piexif.load(str(path))
+    except Exception:  # noqa: BLE001
+        return None
+    for ifd, tag in (
+        ("Exif", piexif.ExifIFD.DateTimeOriginal),
+        ("Exif", piexif.ExifIFD.DateTimeDigitized),
+        ("0th", piexif.ImageIFD.DateTime),
+    ):
         raw = exif.get(ifd, {}).get(tag)
-        if not raw:
-            continue
-        text = _to_text(raw)
-        if text.startswith("0000"):
-            continue
-        try:
-            return datetime.strptime(text[:10], "%Y:%m:%d").date(), name
-        except ValueError:
-            continue
-    # Last resort: filesystem modification time.
-    return date.fromtimestamp(os.path.getmtime(path)), "FileModifyDate"
+        if raw:
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            if not text.startswith("0000") and len(text) >= 4 and text[:4].isdigit():
+                return int(text[:4])
+    return None
 
 
-def get_existing_caption(exif: dict) -> str:
+def resolve_year(path: Path, root: Path) -> tuple[int | None, str]:
+    """Determine the reference year for a file, preferring its year folder."""
+    y = folder_year(path, root)
+    if y is not None:
+        return y, "folder"
+    if path.suffix.lower() in CAPTION_EXTS:
+        y = exif_year(path)
+        if y is not None:
+            return y, "exif"
+    # Last resort: file modification time (unreliable, hence last).
+    return datetime.fromtimestamp(os.path.getmtime(path)).year, "mtime"
+
+
+# --------------------------------------------------------------------------
+# Caption read/write (piexif, JPEG only)
+# --------------------------------------------------------------------------
+
+def read_caption(path: Path) -> str:
+    try:
+        exif = piexif.load(str(path))
+    except Exception:  # noqa: BLE001
+        return ""
     raw = exif.get("0th", {}).get(piexif.ImageIFD.ImageDescription)
-    return _to_text(raw) if raw else ""
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    return text.split("\x00")[0].strip()
+
+
+def write_caption(path: Path, caption: str) -> None:
+    try:
+        exif = piexif.load(str(path))
+    except Exception:  # noqa: BLE001
+        exif = {"0th": {}, "Exif": {}, "1st": {}, "GPS": {}, "Interop": {}}
+    exif.setdefault("0th", {})
+    if caption:
+        exif["0th"][piexif.ImageIFD.ImageDescription] = caption.encode("utf-8")
+    else:
+        exif["0th"].pop(piexif.ImageIFD.ImageDescription, None)
+    piexif.insert(piexif.dump(exif), str(path))
 
 
 # --------------------------------------------------------------------------
-# Main processing
+# Apply / undo for a single file
 # --------------------------------------------------------------------------
 
-def process_file(path: Path, dob: date, dry_run: bool) -> str:
-    """Process a single file. Returns a one-line status string."""
+def apply_file(path: Path, dob: date, root: Path, dry_run: bool) -> str:
     ext = path.suffix.lower()
-
     if AGE_SUFFIX_RE.search(path.stem):
         return f"skip  (already tagged): {path.name}"
 
-    if ext in UNSUPPORTED_MEDIA_EXTS:
-        return f"SKIP  (format not supported by piexif): {path.name}"
-    if ext not in SUPPORTED_EXTS:
-        return f"skip  (not a media file): {path.name}"
-
-    try:
-        exif = piexif.load(str(path))
-    except Exception as e:  # noqa: BLE001 - report and move on
-        return f"SKIP  (could not read EXIF: {e}): {path.name}"
-
-    capture_date, date_src = get_capture_date(exif, path)
-    years = age_on(dob, capture_date)
-    if years < 0:
-        return f"SKIP  (dated before DOB: {capture_date}): {path.name}"
-    token = str(years)
-
-    existing = get_existing_caption(exif)
-    new_caption = f"Age {token}" + (f" - {existing}" if existing else "")
+    year, src = resolve_year(path, root)
+    if year is None:
+        return f"SKIP  (no year could be determined): {path.name}"
+    age = year - dob.year
+    if age < 0:
+        return f"SKIP  (year {year} is before birth year): {path.name}"
+    token = str(age)
 
     new_path = path.with_name(f"{path.stem}_({token}){path.suffix}")
     if new_path.exists() and new_path != path:
         return f"SKIP  (target exists): {new_path.name}"
 
+    can_caption = ext in CAPTION_EXTS
+    existing = read_caption(path) if can_caption else ""
+    new_caption = f"Age {token}" + (f" - {existing}" if existing else "")
+
     if dry_run:
-        return (
-            f"would tag [{capture_date} via {date_src}] -> {token}\n"
-            f"          caption: {new_caption!r}\n"
-            f"          rename : {path.name} -> {new_path.name}"
-        )
+        cap = f"caption: {new_caption!r}" if can_caption else "caption: (rename only)"
+        return (f"would tag [{year} via {src}] -> {token}\n"
+                f"          {cap}\n"
+                f"          rename : {path.name} -> {new_path.name}")
 
-    # Write the caption back into the EXIF, then rename the file.
-    exif.setdefault("0th", {})
-    exif["0th"][piexif.ImageIFD.ImageDescription] = new_caption.encode("utf-8")
-    try:
-        piexif.insert(piexif.dump(exif), str(path))
-    except Exception as e:  # noqa: BLE001
-        return f"SKIP  (could not write EXIF: {e}): {path.name}"
-
+    if can_caption:
+        write_caption(path, new_caption)
     path.rename(new_path)
-    return f"done  [{capture_date}] {token}: {path.name} -> {new_path.name}"
+    note = "" if can_caption else "  (renamed only; caption not embeddable on iOS)"
+    return f"done  [{year}] {token}: {path.name} -> {new_path.name}{note}"
 
 
-def iter_media(root: Path):
+def undo_file(path: Path, dry_run: bool) -> str | None:
+    ext = path.suffix.lower()
+    if not AGE_SUFFIX_RE.search(path.stem):
+        return None  # nothing this script added
+    orig_stem = AGE_SUFFIX_RE.sub("", path.stem)
+    orig_path = path.with_name(f"{orig_stem}{path.suffix}")
+    if orig_path.exists() and orig_path != path:
+        return f"SKIP  (original name already exists): {orig_path.name}"
+
+    restored = None
+    if ext in CAPTION_EXTS:
+        m = ADDED_CAPTION_RE.match(read_caption(path))
+        if m:
+            restored = (m.group("orig") or "").strip()
+
+    if dry_run:
+        cap = f"  restore caption -> {restored!r}" if restored is not None else ""
+        return f"would undo: {path.name} -> {orig_path.name}{cap}"
+
+    if restored is not None:
+        write_caption(path, restored)
+    path.rename(orig_path)
+    return f"undone: {path.name} -> {orig_path.name}"
+
+
+# --------------------------------------------------------------------------
+# Driver
+# --------------------------------------------------------------------------
+
+def media_files(root: Path):
     for p in sorted(root.rglob("*")):
-        if p.is_file():
+        if p.is_file() and p.suffix.lower() in MEDIA_EXTS:
             yield p
 
 
@@ -199,28 +254,37 @@ def main() -> None:
         default=DEFAULT_DOB,
         help="Date of birth as YYYY-MM-DD (default: %(default)s)",
     )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Show what would change without modifying anything",
-    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would change without modifying anything")
+    parser.add_argument("--undo", action="store_true",
+                        help="Reverse a previous run (restore names + captions)")
     args = parser.parse_args()
 
     root = Path(args.root).expanduser()
     if not root.is_dir():
         sys.exit(f"ERROR: '{root}' is not a directory.")
 
-    print(f"Scanning {root}  (DOB: {args.dob}, dry-run: {args.dry_run})\n")
+    # Show the subdirectories up front so traversal is visible.
+    subdirs = sorted(d.name for d in root.iterdir() if d.is_dir())
+    year_dirs = [d for d in subdirs if YEAR_RE.match(d)]
+    print(f"Scanning {root}  (DOB: {args.dob}, "
+          f"mode: {'UNDO' if args.undo else 'apply'}, dry-run: {args.dry_run})")
+    print(f"Subdirectories: {', '.join(subdirs) or '(none)'}")
+    print(f"Year folders  : {', '.join(year_dirs) or '(none)'}\n")
 
-    handled = 0
-    for path in iter_media(root):
-        line = process_file(path, args.dob, args.dry_run)
-        # Only count/print real media files, keep the noise down.
-        if line.startswith("skip  (not a media file)"):
-            continue
-        handled += 1
+    count = 0
+    for path in media_files(root):
+        if args.undo:
+            line = undo_file(path, args.dry_run)
+            if line is None:
+                continue
+        else:
+            line = apply_file(path, args.dob, root, args.dry_run)
+        count += 1
         print(line)
 
-    print(f"\n{'Previewed' if args.dry_run else 'Processed'} {handled} media file(s).")
+    verb = "Previewed" if args.dry_run else ("Reversed" if args.undo else "Processed")
+    print(f"\n{verb} {count} file(s).")
 
 
 if __name__ == "__main__":
