@@ -5,22 +5,26 @@ add_age_to_captions_ashell.py
 
 Pure-Python version for iOS a-Shell (no ExifTool / Perl needed).
 
-Your media lives in `Me/<year>/...` (year-named subdirectories). This
-script reads those year subdirectories first, and for each photo/video it
-uses the YEAR of its folder to compute your age:
+Your media lives in `Me/<year>/...` (year-named subdirectories). For each
+photo/video the age is computed like this:
 
-        age = <year folder>  -  <birth year>
+    * If the file has a usable EXIF capture date  -> exact age on that
+      date, counting your Sept-1 birthday. (Jan-Aug 2020 -> 17,
+      Sep-Dec 2020 -> 18, given a 2002-09-01 birth date.)
+    * Otherwise -> simple math from the YEAR FOLDER:  <year> - <birth year>
+      (e.g. anything in Me/2020/ with no embedded date -> 18).
+
+The folder-year fallback exists because many files have no reliable
+embedded date, and after copying to iOS their file timestamps all look
+like "today" -- which is what produced the wrong ages before. We only
+fall back to the file timestamp if there's no EXIF date AND no year
+folder.
 
 That age is prepended to the caption (for JPEGs) and appended to the
 filename for every photo and video:
 
     Me/2026/IMG_1234.jpg  ->  Me/2026/IMG_1234_(24).jpg
     (and its caption becomes:  "Age 24 - <original caption>")
-
-Driving the age from the YEAR FOLDER (instead of each file's EXIF date)
-is deliberate: many files have no reliable embedded date, and after
-copying to iOS their file timestamps all look like "today", which is what
-produced the wrong ages before.
 
 ------------------------------------------------------------------------
 What gets changed
@@ -83,6 +87,9 @@ MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 # Only these can have a caption embedded by piexif.
 CAPTION_EXTS = {".jpg", ".jpeg"}
 
+# Formats piexif can read an EXIF date out of (for accurate, birthday-aware age).
+DATE_READABLE_EXTS = {".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
+
 # A 4-digit year, used both to recognize year folders and the age suffix.
 YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 
@@ -108,8 +115,16 @@ def folder_year(path: Path, root: Path) -> int | None:
     return None
 
 
-def exif_year(path: Path) -> int | None:
-    """Best-effort capture year from JPEG EXIF (fallback only)."""
+def age_on(dob: date, on: date) -> int:
+    """Exact age in whole completed years on a given date (honors birthday)."""
+    years = on.year - dob.year
+    if (on.month, on.day) < (dob.month, dob.day):
+        years -= 1
+    return years
+
+
+def exif_date(path: Path) -> date | None:
+    """Full capture date from EXIF, or None. Used for birthday-accurate age."""
     try:
         exif = piexif.load(str(path))
     except Exception:  # noqa: BLE001
@@ -120,24 +135,31 @@ def exif_year(path: Path) -> int | None:
         ("0th", piexif.ImageIFD.DateTime),
     ):
         raw = exif.get(ifd, {}).get(tag)
-        if raw:
-            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-            if not text.startswith("0000") and len(text) >= 4 and text[:4].isdigit():
-                return int(text[:4])
+        if not raw:
+            continue
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        text = text.strip()
+        if text.startswith("0000"):
+            continue
+        try:
+            return datetime.strptime(text[:10], "%Y:%m:%d").date()
+        except ValueError:
+            continue
     return None
 
 
-def resolve_year(path: Path, root: Path) -> tuple[int | None, str]:
-    """Determine the reference year for a file, preferring its year folder."""
+def resolve_age(path: Path, root: Path, dob: date) -> tuple[int, str]:
+    """Birthday-accurate age from EXIF when possible, else folder-year math."""
+    if path.suffix.lower() in DATE_READABLE_EXTS:
+        d = exif_date(path)
+        if d is not None:
+            return age_on(dob, d), f"exif {d}"
     y = folder_year(path, root)
     if y is not None:
-        return y, "folder"
-    if path.suffix.lower() in CAPTION_EXTS:
-        y = exif_year(path)
-        if y is not None:
-            return y, "exif"
+        return y - dob.year, f"folder {y}"
     # Last resort: file modification time (unreliable, hence last).
-    return datetime.fromtimestamp(os.path.getmtime(path)).year, "mtime"
+    y = datetime.fromtimestamp(os.path.getmtime(path)).year
+    return y - dob.year, f"mtime {y}"
 
 
 # --------------------------------------------------------------------------
@@ -178,12 +200,9 @@ def apply_file(path: Path, dob: date, root: Path, dry_run: bool) -> str:
     if AGE_SUFFIX_RE.search(path.stem):
         return f"skip  (already tagged): {path.name}"
 
-    year, src = resolve_year(path, root)
-    if year is None:
-        return f"SKIP  (no year could be determined): {path.name}"
-    age = year - dob.year
+    age, src = resolve_age(path, root, dob)
     if age < 0:
-        return f"SKIP  (year {year} is before birth year): {path.name}"
+        return f"SKIP  ({src} is before birth date): {path.name}"
     token = str(age)
 
     new_path = path.with_name(f"{path.stem}_({token}){path.suffix}")
@@ -196,7 +215,7 @@ def apply_file(path: Path, dob: date, root: Path, dry_run: bool) -> str:
 
     if dry_run:
         cap = f"caption: {new_caption!r}" if can_caption else "caption: (rename only)"
-        return (f"would tag [{year} via {src}] -> {token}\n"
+        return (f"would tag [{src}] -> {token}\n"
                 f"          {cap}\n"
                 f"          rename : {path.name} -> {new_path.name}")
 
@@ -204,7 +223,7 @@ def apply_file(path: Path, dob: date, root: Path, dry_run: bool) -> str:
         write_caption(path, new_caption)
     path.rename(new_path)
     note = "" if can_caption else "  (renamed only; caption not embeddable on iOS)"
-    return f"done  [{year}] {token}: {path.name} -> {new_path.name}{note}"
+    return f"done  [{src}] {token}: {path.name} -> {new_path.name}{note}"
 
 
 def undo_file(path: Path, dry_run: bool) -> str | None:
